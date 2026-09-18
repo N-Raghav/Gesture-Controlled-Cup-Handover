@@ -1,0 +1,413 @@
+{
+  "modules": [
+    {
+      "type": "registry",
+      "name": "viam_ufactory",
+      "module_id": "viam:ufactory",
+      "version": "latest"
+    },
+    {
+      "type": "registry",
+      "name": "viam_realsense",
+      "module_id": "viam:realsense",
+      "version": "latest"
+    },
+    {
+      "type": "registry",
+      "name": "erh_vmodutils",
+      "module_id": "erh:vmodutils",
+      "version": "latest"
+    },
+    {
+      "type": "registry",
+      "name": "viam_camera-calibration",
+      "module_id": "viam:camera-calibration",
+      "version": "latest"
+    },
+    {
+      "type": "registry",
+      "name": "viam_tflite_cpu",
+      "module_id": "viam:tflite_cpu",
+      "version": "latest"
+    },
+    {
+      "type": "registry",
+      "name": "viam_detections-to-segments",
+      "module_id": "viam:detections-to-segments",
+      "version": "latest"
+    }
+  ],
+  "components": [
+    {
+      "name": "arm",
+      "api": "rdk:component:arm",
+      "model": "viam:ufactory:xArm6",
+      "attributes": {
+        "host": "192.168.1.240",
+        "speed_degs_per_sec": 15,
+        "ufactory-studio-proxy": true
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "gripper",
+      "api": "rdk:component:gripper",
+      "model": "viam:ufactory:gripper",
+      "attributes": {
+        "arm": "arm"
+      },
+      "frame": {
+        "parent": "arm",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 105
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "cam",
+      "api": "rdk:component:camera",
+      "model": "viam:camera:realsense",
+      "attributes": {
+        "sensors": [
+          "color",
+          "depth"
+        ],
+        "align_color_depth": true,
+        "serial_number": "150622070496"
+      },
+      "frame": {
+        "parent": "arm",
+        "translation": {
+          "x": -65.06051657890819,
+          "y": 32.286350260202454,
+          "z": 20.709553334321498
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": -0.014474576084224401,
+            "y": -0.0024146059847836646,
+            "z": 0.9998923223653235,
+            "th": 81.54762415203804
+          }
+        }
+      }
+    },
+    {
+      "name": "home",
+      "api": "rdk:component:switch",
+      "model": "erh:vmodutils:arm-position-saver",
+      "attributes": {
+        "arm": "arm",
+        "motion": "builtin",
+        "point": {
+          "X": 187.21903348433494,
+          "Y": 36.11541758394837,
+          "Z": 386.1985804878573
+        },
+        "orientation": {
+          "x": 0.07951343407776505,
+          "y": 0.0964422637483874,
+          "z": -0.99215749937409,
+          "th": 50.40256760042287
+        }
+      }
+    },
+    {
+      "name": "approach-pose",
+      "api": "rdk:component:switch",
+      "model": "erh:vmodutils:arm-position-saver",
+      "attributes": {
+        "arm": "arm"
+      }
+    },
+    {
+      "name": "grasp-pose",
+      "api": "rdk:component:switch",
+      "model": "erh:vmodutils:arm-position-saver",
+      "attributes": {
+        "arm": "arm"
+      }
+    },
+    {
+      "name": "travel-pose",
+      "api": "rdk:component:switch",
+      "model": "erh:vmodutils:arm-position-saver",
+      "attributes": {
+        "arm": "arm"
+      }
+    },
+    {
+      "name": "place-pose",
+      "api": "rdk:component:switch",
+      "model": "erh:vmodutils:arm-position-saver",
+      "attributes": {
+        "arm": "arm"
+      }
+    },
+    {
+      "name": "table",
+      "api": "rdk:component:gripper",
+      "model": "erh:vmodutils:obstacle",
+      "attributes": {
+        "geometries": [
+          {
+            "type": "box",
+            "x": 3000,
+            "y": 3000,
+            "z": 200
+          }
+        ]
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": -123
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "safety-wall-front",
+      "api": "rdk:component:gripper",
+      "model": "erh:vmodutils:obstacle",
+      "attributes": {
+        "geometries": [
+          {
+            "type": "box",
+            "x": 100,
+            "y": 3000,
+            "z": 1600
+          }
+        ]
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 740,
+          "y": 0,
+          "z": 300
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "safety-wall-side",
+      "api": "rdk:component:gripper",
+      "model": "erh:vmodutils:obstacle",
+      "attributes": {
+        "geometries": [
+          {
+            "type": "box",
+            "x": 3000,
+            "y": 100,
+            "z": 1600
+          }
+        ]
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 0,
+          "y": -500,
+          "z": 300
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "ceiling",
+      "api": "rdk:component:gripper",
+      "model": "erh:vmodutils:obstacle",
+      "attributes": {
+        "geometries": [
+          {
+            "type": "box",
+            "x": 3000,
+            "y": 3000,
+            "z": 100
+          }
+        ]
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 1050
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "calibration-charuco",
+      "api": "rdk:component:pose_tracker",
+      "model": "viam:camera-calibration:charuco",
+      "attributes": {
+        "camera": "cam",
+        "dictionary": "DICT_5X5_100",
+        "squares_x": 14,
+        "squares_y": 9,
+        "square_length_mm": 20,
+        "marker_length_mm": 15,
+        "image_source": "color"
+      }
+    }
+  ],
+  "services": [
+    {
+      "name": "builtin",
+      "api": "rdk:service:motion",
+      "model": "rdk:builtin:builtin",
+      "attributes": {
+        "input_range_override": {
+          "arm": {
+            "5": {
+              "min": -3.1416,
+              "max": 3.1416
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "calibration-handeye",
+      "api": "rdk:service:generic",
+      "model": "viam:camera-calibration:handeye",
+      "attributes": {
+        "arm": "arm",
+        "pose_tracker": "calibration-charuco",
+        "auto_apply_result": false,
+        "input_range_override": {
+          "0": {
+            "Min": -1.5708,
+            "Max": 1.5708
+          },
+          "1": {
+            "Min": -1.5708,
+            "Max": 0.5236
+          },
+          "2": {
+            "Min": -2.0944,
+            "Max": 0.5236
+          },
+          "3": {
+            "Min": -1.5708,
+            "Max": 1.5708
+          },
+          "4": {
+            "Min": -1.0472,
+            "Max": 1.5708
+          },
+          "5": {
+            "Min": -3.1416,
+            "Max": 3.1416
+          }
+        }
+      }
+    },
+    {
+      "name": "mlmodel-1",
+      "api": "rdk:service:mlmodel",
+      "model": "viam:mlmodel-tflite:tflite_cpu",
+      "attributes": {
+        "package_reference": "6d6c7293-bc67-43e4-9c8b-31c76aac27d3/cup-detection",
+        "model_path": "${packages.ml_model.cup-detection}/cup-detection.tflite",
+        "label_path": "${packages.ml_model.cup-detection}/labels.txt"
+      }
+    },
+    {
+      "name": "vision-1",
+      "api": "rdk:service:vision",
+      "model": "rdk:builtin:mlmodel",
+      "attributes": {
+        "default_minimum_confidence": 0.5,
+        "mlmodel_name": "mlmodel-1"
+      }
+    },
+    {
+      "name": "segmentation",
+      "api": "rdk:service:vision",
+      "model": "viam:vision:detections-to-segments",
+      "attributes": {
+        "detector_name": "vision-1",
+        "camera_name": "cam",
+        "mean_k": 5,
+        "sigma": 1.25,
+        "confidence_threshold_pct": 0.5,
+        "depth_threshold_mm": 100,
+        "min_points_in_segment": 50,
+        "clustering_radius_mm": 10
+      }
+    }
+  ],
+  "packages": [
+    {
+      "name": "cup-detection",
+      "package": "6d6c7293-bc67-43e4-9c8b-31c76aac27d3/cup-detection",
+      "type": "ml_model",
+      "version": "latest"
+    }
+  ]
+}
