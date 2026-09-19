@@ -74,6 +74,7 @@ Z_OFFSET_MM = 0  # shift added to every estimated cup height, to correct a calib
 LINE_TOLERANCE_MM = 5  # how far the straight moves may stray from the line
 ORIENTATION_TOLERANCE_DEGS = 5  # ...and how far the gripper may tilt on them
 SETTLE_S = 0.3  # finger gripper settle time after grab
+CAMERA_SETTLE_S = 0.2  # let the camera catch up after the arm stops
 MIN_CUP_HEIGHT_MM = 40  # reject flat detections such as the table
 MIN_POINTS = 50
 MAX_POINTS = 4000  # a cup cloud has ~25k points; keep every n-th so the estimate stays fast
@@ -82,10 +83,11 @@ MAX_POINTS = 4000  # a cup cloud has ~25k points; keep every n-th so the estimat
 HAND_MIN_CONFIDENCE = 0.3  # the detector is less sure of a hand close to the lens
 GESTURE_MIN_CONFIDENCE = 0.5  # the gesture detector's own threshold is 0.5 too
 HAND_LOST_GRACE_S = 0.7  # a hand this close to the camera flickers; tolerate gaps this long
-HAND_DWELL_S = 1.0  # a hand must stay in view this long before the gripper opens
+HAND_DWELL_S = 0.3  # a hand must stay in view this long before the gripper opens
 RIGHT_HAND_LABEL = "right"  # substring of the hand detector's class name for a right hand
 LEFT_HAND_LABEL = "left"  # ...and for a left hand
 RELEASE_TIMEOUT_S = 30
+NO_HAND_TIMEOUT_S = 3  # with no hand in view this long at the end pose, the cup is put back
 RELEASE_SPEED = 300  # gripper speed while letting go (1-5000; lower is slower)
 NORMAL_SPEED = 1500  # ...and restored afterwards (the finger gripper's firmware default)
 RELEASE_OPEN_TIMEOUT_S = 15  # stop waiting for the slow opening after this long
@@ -114,9 +116,9 @@ CUP_VIEW_POSE = Pose(
 START_JOINTS_DEG: list[float] | None = None
 
 # --- Connection details -------------------------------------------------------
-MACHINE_ADDRESS = os.environ.get("VIAM_MACHINE_ADDRESS", "armfarm8-main.310sld03v2.viam.cloud")
-API_KEY = os.environ.get("VIAM_API_KEY", "5bh4v7iq5ngnw1as33asikvsak380wef")
-API_KEY_ID = os.environ.get("VIAM_API_KEY_ID", "4c8355a9-92c2-4f69-87f1-c579606e23c2")
+MACHINE_ADDRESS = os.environ.get("VIAM_MACHINE_ADDRESS", "mybeautifularm")
+API_KEY = os.environ.get("VIAM_API_KEY", "mybeautifulkey")
+API_KEY_ID = os.environ.get("VIAM_API_KEY_ID", "mybeautifulkeyid")
 
 # --- Resource names (must match the CONFIGURE tab exactly) --------------------
 ARM_NAME = "arm"
@@ -557,8 +559,7 @@ async def release_gesture_seen(machine: RobotClient, hands: list) -> bool:
 async def wait_for_pick_gesture(machine: RobotClient) -> None:
     print("Waiting for a right-hand thumbs up...")
     while True:
-        hands = await hands_in_view(machine)
-        gestures = await gesture_labels(machine)
+        hands, gestures = await asyncio.gather(hands_in_view(machine), gesture_labels(machine))
         if hands or gestures:
             print(f"  hands in view: {[d.class_name for d in hands]}  gestures: {gestures}")
         if await pick_gesture_seen(machine, hands, gestures):
@@ -588,14 +589,21 @@ async def hand_over(machine, gripper, release: bool) -> bool:
     """Take the held cup to the end pose; open when the release gesture is shown. False if nobody asked for it."""
     print("Moving to the end pose")
     await Switch.from_robot(machine, END_SWITCH).set_position(2)
-    await asyncio.sleep(0.5)
+    lap("moved to the end pose")
+    await asyncio.sleep(CAMERA_SETTLE_S)
 
     since, last_seen, deadline = None, 0.0, time.monotonic() + RELEASE_TIMEOUT_S
+    last_hand = time.monotonic()
     print("Waiting for the release gesture...")
     while time.monotonic() < deadline:
         hands = await hands_in_view(machine)
         gesture = await release_gesture_seen(machine, hands)
         now = time.monotonic()
+        if hands:
+            last_hand = now
+        elif now - last_hand >= NO_HAND_TIMEOUT_S:
+            print(f"No hand in view for {NO_HAND_TIMEOUT_S} s")
+            return False
         if gesture:
             since, last_seen = since or now, now
         elif since and now - last_seen > HAND_LOST_GRACE_S:
@@ -627,6 +635,7 @@ async def release_cup(gripper: Gripper) -> None:
     while await gripper.is_moving() and time.monotonic() < deadline:
         await asyncio.sleep(0.1)
     await asyncio.sleep(SETTLE_S)
+    lap("gripper opened")
     try:
         await gripper.do_command({"set_gripper_speed": NORMAL_SPEED})
     except Exception as e:
@@ -646,6 +655,8 @@ async def execute(machine: RobotClient, plan: dict[str, Pose], args) -> None:
     gripper = Gripper.from_robot(machine, GRIPPER_NAME)
     motion = MotionClient.from_robot(machine, MOTION_NAME)
 
+    # Open the gripper before the arm moves. Running it alongside the motion
+    # service call dropped the connection and expired the session.
     await gripper.open()
     # A straight move stays in the arm's current wrist configuration. A free
     # plan may reach the same pose with the wrist turned half a revolution.
@@ -661,6 +672,7 @@ async def execute(machine: RobotClient, plan: dict[str, Pose], args) -> None:
         return
     grabbed = await gripper.grab()
     await asyncio.sleep(SETTLE_S)
+    lap("gripper closed")
     if not grabbed:
         print("Gripper closed on nothing; check the grasp height and cup width")
         return
@@ -669,7 +681,8 @@ async def execute(machine: RobotClient, plan: dict[str, Pose], args) -> None:
     if args.handover and not await hand_over(machine, gripper, release=not args.no_release):
         print("No release gesture; putting the cup back")
         await put_back(motion, gripper, plan)
-        await Switch.from_robot(machine, END_SWITCH).set_position(2)
+        print("Moving to the start pose")
+        await go_to_start(machine)
 
 
 async def watch_gestures(machine: RobotClient, seconds: float = 60) -> None:
@@ -689,7 +702,7 @@ async def plan_from_camera(machine: RobotClient, args) -> dict[str, Pose]:
     print("Moving to the cup-view pose")
     await move_gripper(MotionClient.from_robot(machine, MOTION_NAME), CUP_VIEW_POSE, component=ARM_NAME)
     lap("moved to the cup-view pose")
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(CAMERA_SETTLE_S)
     vision = VisionClient.from_robot(machine, VISION_NAME)
 
     points, cam_origin = await detect_cup(machine, vision)
