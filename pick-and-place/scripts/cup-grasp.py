@@ -2,29 +2,28 @@
 Viam Pick-and-Place — Cup Grasp Generator
 =========================================
 
-Generates a grasp pose for a cup, from the side or from above:
-
-    top   (default) The gripper points straight down. The fingers descend on
-          either side of the cup, just below the rim, and close across it.
-    side  The gripper comes in horizontally, the way a hand does, and wraps the
-          body of the cup around its middle.
+Generates a top-down grasp pose for a cup: the gripper points straight down,
+and the fingers descend on either side of the cup, just below the rim, and
+close across it.
 
     1. Detect the cup and read its point cloud from the segmentation service.
     2. Move the points into the world frame and estimate the cup's axis, radius
        and height.
     3. Build three gripper poses in the world frame: approach (standoff), grasp
-       and lift. The fingers close along a horizontal line tangent to the arm's
-       reach, so the wrist doesn't have to swing sideways.
+       and lift. The wrist keeps the yaw it has at the cup-view pose.
 
 By default this only prints the plan. Pass --execute to move the arm.
 
-With --handover, after lifting the cup the arm waits for your hand to appear
-under the camera, moves the cup to just above it, and opens the gripper when
-it sees your hand for a moment. If nobody takes it, the cup is put
-back where it was.
+With --execute the arm first moves to the start pose and waits for the "pick"
+gesture (pick_gesture_seen, a right-hand thumbs up), then goes to the cup-view pose
+and runs the grasp.
 
-    uv run python cup-grasp.py                        # dry run, top-down grasp
-    uv run python cup-grasp.py --mode side            # dry run, side grasp
+With --handover, after lifting the cup the arm goes to the end pose and waits
+for the "release" gesture (release_gesture_seen, either hand in view for now), then
+opens the gripper. If nobody shows it in time, the cup is put back where it
+was and the arm finishes at the end pose.
+
+    uv run python cup-grasp.py                        # dry run
     uv run python cup-grasp.py --execute              # approach, grasp and lift
     uv run python cup-grasp.py --execute --handover   # ...then hand the cup over
     uv run python cup-grasp.py --execute --handover --no-release   # rehearse: never opens
@@ -46,22 +45,23 @@ import os
 import struct
 import time
 
-from viam.errors import ResourceNotFoundError
 from viam.robot.client import RobotClient
+from viam.components.arm import Arm
 from viam.components.gripper import Gripper
 from viam.components.switch import Switch
 from viam.services.motion import MotionClient
 from viam.services.vision import VisionClient
 from viam.proto.common import PoseInFrame, Pose
+from viam.proto.component.arm import JointPositions
 from viam.proto.service.motion import Constraints, LinearConstraint
 
 # --- Tuning constants ---------------------------------------------------------
-GRASP_HEIGHT_FRACTION = 0.55  # side grasp: where along the cup's height to hold it (0 base, 1 rim)
 TOP_GRASP_DEPTH_MM = 40  # top-down grasp: how far below the rim the finger pads sit
-RIM_CLEARANCE_MM = 15  # side grasp: keep the finger pads at least this far below the rim
 TABLE_CLEARANCE_MM = 15  # ...and this far above the table
-BAND_MM = 10  # half-height of the slice used to measure the cup's width
-STANDOFF_MM = 100  # how far back from (or above) the cup the approach pose sits
+RIM_BAND_MM = 16  # thickness of the slice below the rim used to find the cup's centre and width
+MAX_CUP_DEPTH_MM = 100  # anything this far behind the cup's nearest surface (a wall, the table) is not the cup
+MIN_RIM_ARC_DEG = 180  # a circle fit needs the rim visible around at least this much of its circumference
+STANDOFF_MM = 100  # how far above the cup the approach pose sits
 LIFT_MM = 80  # how far to raise the cup after grabbing
 GRIPPER_LENGTH_MM = (
     -60
@@ -69,23 +69,49 @@ GRIPPER_LENGTH_MM = (
 GRIPPER_MAX_OPEN_MM = 85  # widest opening of the finger gripper
 FINGER_CLEARANCE_MM = 3  # spare room per side when the gripper is open
 FINGER_ROLL_DEG = 0  # 0 if the fingers close along the gripper's y axis, 90 if along x
+KEEP_WRIST_YAW = True  # top-down: keep the fingers closing the way they do at the cup-view pose, instead of turning the wrist to the tangent
 Z_OFFSET_MM = 0  # shift added to every estimated cup height, to correct a calibration error
 LINE_TOLERANCE_MM = 5  # how far the straight moves may stray from the line
 ORIENTATION_TOLERANCE_DEGS = 5  # ...and how far the gripper may tilt on them
 SETTLE_S = 0.3  # finger gripper settle time after grab
 MIN_CUP_HEIGHT_MM = 40  # reject flat detections such as the table
 MIN_POINTS = 50
+MAX_POINTS = 4000  # a cup cloud has ~25k points; keep every n-th so the estimate stays fast
 
 # --- Handover tuning ----------------------------------------------------------
-HAND_CLEARANCE_MM = 60  # gap between the bottom of the cup and the top of the hand
-HAND_MIN_HEIGHT_MM = 20  # points this close to the table are table, not hand
-HAND_MAX_Z_MM = 400  # ...and points above this are depth noise
-HAND_EXCLUDE_MARGIN_MM = 25  # ignore points this close to the held cup when finding the hand
-HAND_STABLE_MM = 20  # the hand must hold still this closely between two looks
+HAND_MIN_CONFIDENCE = 0.3  # the detector is less sure of a hand close to the lens
+GESTURE_MIN_CONFIDENCE = 0.5  # the gesture detector's own threshold is 0.5 too
+HAND_LOST_GRACE_S = 0.7  # a hand this close to the camera flickers; tolerate gaps this long
 HAND_DWELL_S = 1.0  # a hand must stay in view this long before the gripper opens
-FIND_HAND_TIMEOUT_S = 30
+RIGHT_HAND_LABEL = "right"  # substring of the hand detector's class name for a right hand
+LEFT_HAND_LABEL = "left"  # ...and for a left hand
 RELEASE_TIMEOUT_S = 30
-REACH_LIMITS = {"x": (150, 640), "y": (-400, 450), "z_max": 500}  # keep the cup away from the walls
+RELEASE_SPEED = 300  # gripper speed while letting go (1-5000; lower is slower)
+NORMAL_SPEED = 1500  # ...and restored afterwards (the finger gripper's firmware default)
+RELEASE_OPEN_TIMEOUT_S = 15  # stop waiting for the slow opening after this long
+
+# --- Start pose ---------------------------------------------------------------
+# With --execute the arm first goes to the start switch and waits for the "pick"
+# gesture, then moves to the cup-view pose and carries on. After the grasp it
+# goes to the end switch to wait for the "release" gesture. The start and end
+# poses are saved on the machine (arm-position-saver switches); change them there.
+START_SWITCH = "homepose"
+END_SWITCH = "goalpose"  # where the arm takes the cup and releases it
+# Where the arm looks at the cup from before grasping. It is the pose of the
+# arm's own end (like the switches), not of the gripper. World frame, mm / degrees.
+CUP_VIEW_POSE = Pose(
+    x=187.21903348433494,
+    y=36.11541758394837,
+    z=386.1985804878573,
+    o_x=0.07951343407776505,
+    o_y=0.0964422637483874,
+    o_z=-0.99215749937409,
+    theta=50.40256760042287,
+)
+# Joint angles (degrees, joints 1-6) for the start pose, from --print-joints.
+# Set these to reach the start pose by a plain joint move, which never picks a
+# different wrist solution. None: use the start switch instead.
+START_JOINTS_DEG: list[float] | None = None
 
 # --- Connection details -------------------------------------------------------
 MACHINE_ADDRESS = os.environ.get("VIAM_MACHINE_ADDRESS", "armfarm8-main.310sld03v2.viam.cloud")
@@ -93,13 +119,13 @@ API_KEY = os.environ.get("VIAM_API_KEY", "5bh4v7iq5ngnw1as33asikvsak380wef")
 API_KEY_ID = os.environ.get("VIAM_API_KEY_ID", "4c8355a9-92c2-4f69-87f1-c579606e23c2")
 
 # --- Resource names (must match the CONFIGURE tab exactly) --------------------
+ARM_NAME = "arm"
 GRIPPER_NAME = "gripper"
 CAMERA_NAME = "cam"
 VISION_NAME = "segmentation-cup"  # cup detections lifted to 3D
 HAND_DETECTOR_NAME = "hand-detect"  # 2D hand boxes
-HAND_VISION_NAME = "hand-segm"  # hand detections lifted to 3D
+GESTURE_DETECTOR_NAME = "gesture-detector"  # hand gestures
 MOTION_NAME = "builtin"
-HOME_POSE = "home"
 BASE_XY = (0.0, 0.0)  # arm base in the world frame
 
 
@@ -108,8 +134,19 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[round((len(ordered) - 1) * pct / 100)]
 
 
+_last_lap = time.monotonic()
+
+
+def lap(what: str) -> None:
+    """Print how long the step that just finished took."""
+    global _last_lap
+    now = time.monotonic()
+    print(f"  [{now - _last_lap:.1f}s] {what}")
+    _last_lap = now
+
+
 def parse_pcd(data: bytes) -> list[tuple[float, float, float]]:
-    """Read x/y/z from a PCD blob (ascii or uncompressed binary)."""
+    """Read x/y/z from a PCD blob (ascii or uncompressed binary), keeping at most about MAX_POINTS."""
     header_end = data.index(b"DATA")
     line_end = data.index(b"\n", header_end)
     header = {
@@ -128,7 +165,7 @@ def parse_pcd(data: bytes) -> list[tuple[float, float, float]]:
 
     if mode == "ascii":
         rows = [line.split() for line in body.decode().splitlines() if line.strip()]
-        return [(float(r[ix]), float(r[iy]), float(r[iz])) for r in rows]
+        return [(float(r[ix]), float(r[iy]), float(r[iz])) for r in rows[:: max(1, len(rows) // MAX_POINTS)]]
     if mode != "binary":
         raise ValueError(f"unsupported PCD encoding: {mode}")
 
@@ -138,7 +175,7 @@ def parse_pcd(data: bytes) -> list[tuple[float, float, float]]:
     )
     step = struct.calcsize(fmt)
     points = []
-    for i in range(count):
+    for i in range(0, count, max(1, count // MAX_POINTS)):
         row = struct.unpack_from(fmt, body, i * step)
         points.append((row[ix], row[iy], row[iz]))
     return points
@@ -206,14 +243,82 @@ async def cloud_in_world(machine: RobotClient, point_cloud: bytes, center_mm: Po
     return world, origin
 
 
-def estimate_cup(points, cam_xyz, top_down: bool) -> dict:
+def fit_circle(xy: list[tuple[float, float]]) -> tuple[float, float, float] | None:
+    """Least-squares circle through the points (x, y, radius), ignoring outliers, or None if it is not a rim.
+
+    The points are the cup's rim seen from above. Stray points (a handle, the
+    table) are dropped by refitting on the 80% that lie nearest the circle.
+    """
+
+    def kasa(pts):
+        n = len(pts)
+        sx = sum(x for x, _ in pts)
+        sy = sum(y for _, y in pts)
+        sxx = sum(x * x for x, _ in pts)
+        syy = sum(y * y for _, y in pts)
+        sxy = sum(x * y for x, y in pts)
+        r2 = [x * x + y * y for x, y in pts]
+        m = [
+            [sxx, sxy, sx, sum(x * r for (x, _), r in zip(pts, r2))],
+            [sxy, syy, sy, sum(y * r for (_, y), r in zip(pts, r2))],
+            [sx, sy, n, sum(r2)],
+        ]
+        for i in range(3):  # Gauss-Jordan
+            pivot = max(range(i, 3), key=lambda r: abs(m[r][i]))
+            m[i], m[pivot] = m[pivot], m[i]
+            if abs(m[i][i]) < 1e-9:
+                return None
+            for r in range(3):
+                if r != i:
+                    f = m[r][i] / m[i][i]
+                    m[r] = [m[r][k] - f * m[i][k] for k in range(4)]
+        a, b, c = (m[i][3] / m[i][i] for i in range(3))
+        cx, cy = a / 2, b / 2
+        return cx, cy, math.sqrt(max(c + cx * cx + cy * cy, 0.0))
+
+    if len(xy) < MIN_POINTS:
+        return None
+    fit = kasa(xy)
+    for _ in range(4):
+        if fit is None:
+            return None
+        cx, cy, r = fit
+        dist = [abs(math.hypot(x - cx, y - cy) - r) for x, y in xy]
+        limit = max(3.0, percentile(dist, 80))
+        fit = kasa([p for p, d in zip(xy, dist) if d <= limit])
+    if fit is None:
+        return None
+
+    cx, cy, r = fit
+    angles = sorted(math.atan2(y - cy, x - cx) for x, y in xy)
+    gaps = [b - a for a, b in zip(angles, angles[1:])] + [angles[0] + 2 * math.pi - angles[-1]]
+    arc = 360 - math.degrees(max(gaps))
+    if arc < MIN_RIM_ARC_DEG or not 10 < r < GRIPPER_MAX_OPEN_MM:
+        return None
+    return cx, cy, r
+
+
+def drop_background(points, cam_xyz):
+    """Keep the points within MAX_CUP_DEPTH_MM of the nearest ones, seen from above.
+
+    The segmentation can merge the wall or the table behind the cup into its
+    cluster, which stretches the cup's apparent size.
+    """
+    ranges = [math.hypot(p[0] - cam_xyz[0], p[1] - cam_xyz[1]) for p in points]
+    limit = percentile(ranges, 3) + MAX_CUP_DEPTH_MM
+    near = [p for p, r in zip(points, ranges) if r <= limit]
+    return near if len(near) >= MIN_POINTS else points
+
+
+def estimate_cup(points, cam_xyz) -> dict:
     """Estimate the cup's vertical axis, radius and vertical extent (world, mm).
 
-    The camera sees only part of the cup, but the silhouette across the view
-    direction is the full diameter. The axis sits one radius behind the nearest
-    surface. A side grasp measures the cup at the grasp height; a top-down
-    grasp measures the rim, which is the widest part the fingers must clear.
+    The rim, seen from above, is fitted with a circle for the axis and radius.
+    If too little of it is visible for that, fall back on the silhouette: it
+    is the full diameter across the view direction, and the axis sits one
+    radius behind the nearest surface.
     """
+    points = drop_background(points, cam_xyz)
     zs = [p[2] for p in points]
     base_z, top_z = percentile(zs, 1), percentile(zs, 99)
     height = top_z - base_z
@@ -224,17 +329,24 @@ def estimate_cup(points, cam_xyz, top_down: bool) -> dict:
             "to a pose that views the whole cup and try again."
         )
 
-    if top_down:
-        grasp_z = top_z - TOP_GRASP_DEPTH_MM
-        measure_z = top_z - BAND_MM
-    else:
-        grasp_z = min(base_z + GRASP_HEIGHT_FRACTION * height, top_z - RIM_CLEARANCE_MM)
-        measure_z = grasp_z
-    grasp_z = max(grasp_z, base_z + TABLE_CLEARANCE_MM)
+    grasp_z = max(top_z - TOP_GRASP_DEPTH_MM, base_z + TABLE_CLEARANCE_MM)
 
-    band = [p for p in points if abs(p[2] - measure_z) <= BAND_MM]
+    band = [p for p in points if p[2] >= top_z - RIM_BAND_MM]
     if len(band) < MIN_POINTS:
         band = points
+
+    circle = fit_circle([(p[0], p[1]) for p in band])
+    if circle:
+        print(f"Rim circle fit: centre ({circle[0]:.0f}, {circle[1]:.0f}), diameter {2 * circle[2]:.0f} mm")
+        return {
+            "x": circle[0],
+            "y": circle[1],
+            "radius": circle[2],
+            "base_z": base_z + Z_OFFSET_MM,
+            "top_z": top_z + Z_OFFSET_MM,
+            "grasp_z": grasp_z + Z_OFFSET_MM,
+        }
+    print("Rim not visible all around; estimating the axis from the silhouette")
 
     # Horizontal view direction v from the camera to the cup, and its perpendicular p.
     mx = sum(p[0] for p in points) / len(points) - cam_xyz[0]
@@ -261,8 +373,12 @@ def estimate_cup(points, cam_xyz, top_down: bool) -> dict:
     }
 
 
-def plan_grasp(cup: dict, top_down: bool) -> dict[str, Pose]:
-    """Build the approach, grasp and lift poses for the gripper frame (world, mm)."""
+def plan_grasp(cup: dict, yaw_deg: float | None = None) -> dict[str, Pose]:
+    """Build the approach, grasp and lift poses for the gripper frame (world, mm).
+
+    yaw_deg, if given, is the heading of the gripper's y axis (see gripper_yaw_deg);
+    the fingers then keep closing along it instead of turning to the tangent.
+    """
     diameter = 2 * cup["radius"]
     if diameter + 2 * FINGER_CLEARANCE_MM > GRIPPER_MAX_OPEN_MM:
         raise ValueError(
@@ -278,53 +394,50 @@ def plan_grasp(cup: dict, top_down: bool) -> dict[str, Pose]:
     dx, dy = rx / reach, ry / reach
     stop_short = abs(GRIPPER_LENGTH_MM)
 
-    if top_down:
-        # Gripper z points straight down. Close the fingers along the tangent
-        # (perpendicular to the reach). Straight down, the tool's y axis is
-        # (sin th, cos th) and its x axis is (-cos th, sin th) in the world xy
-        # plane, so solve th to put the closing axis on the tangent.
-        theta = math.degrees(math.atan2(-dy, dx)) + FINGER_ROLL_DEG
-        # theta and theta + 180 grasp identically; keep the one nearest 0 so the
-        # wrist stays near its neutral yaw (for a cup ahead of the arm, about -7 deg).
-        theta = (theta + 90) % 180 - 90
+    # Gripper z points straight down. Close the fingers along the tangent
+    # (perpendicular to the reach). Straight down, the tool's y axis is
+    # (sin th, cos th) and its x axis is (-cos th, sin th) in the world xy
+    # plane, so solve th to put the closing axis on the tangent.
+    theta = math.degrees(math.atan2(-dy, dx)) + FINGER_ROLL_DEG
+    # theta and theta + 180 grasp identically; keep the one nearest 0 so the
+    # wrist stays near its neutral yaw (for a cup ahead of the arm, about -7 deg).
+    theta = (theta + 90) % 180 - 90
+    if yaw_deg is not None:
+        # A cup is round, so any finger direction works. Straight down, the
+        # tool's y axis points at heading 90 - theta; reuse the current heading.
+        theta = (90 - yaw_deg + 180) % 360 - 180
 
-        def pose(above_mm: float) -> Pose:
-            # The frame sits stop_short above the fingertip contact point.
-            return Pose(
-                x=cup["x"],
-                y=cup["y"],
-                z=cup["grasp_z"] + stop_short + above_mm,
-                o_x=0,
-                o_y=0,
-                o_z=-1,
-                theta=theta,
-            )
-
-        return {
-            "approach": pose(STANDOFF_MM),
-            "grasp": pose(0),
-            "lift": pose(LIFT_MM),
-        }
-
-    # Side grasp: approach radially so the fingers straddle the cup tangentially
-    # and the reach is a straight line out from the shoulder.
-    def pose(back_mm: float, z: float) -> Pose:
-        # back_mm is how far behind the fingertip contact point the frame sits.
+    def pose(above_mm: float) -> Pose:
+        # The frame sits stop_short above the fingertip contact point.
         return Pose(
-            x=cup["x"] - dx * back_mm,
-            y=cup["y"] - dy * back_mm,
-            z=z,
-            o_x=dx,
-            o_y=dy,
-            o_z=0,
-            theta=FINGER_ROLL_DEG,
+            x=cup["x"],
+            y=cup["y"],
+            z=cup["grasp_z"] + stop_short + above_mm,
+            o_x=0,
+            o_y=0,
+            o_z=-1,
+            theta=theta,
         )
 
     return {
-        "approach": pose(stop_short + STANDOFF_MM, cup["grasp_z"]),
-        "grasp": pose(stop_short, cup["grasp_z"]),
-        "lift": pose(stop_short, cup["grasp_z"] + LIFT_MM),
+        "approach": pose(STANDOFF_MM),
+        "grasp": pose(0),
+        "lift": pose(LIFT_MM),
     }
+
+
+async def gripper_yaw_deg(machine: RobotClient) -> float:
+    """The heading of the gripper's y axis (the way its fingers close) in the world.
+
+    Whatever way the gripper points, this axis stays horizontal, so it says which
+    way to turn the wrist for a top-down grasp. The x axis would not: it points
+    straight up or down when the gripper is horizontal.
+    """
+    pose = (
+        await machine.transform_pose(PoseInFrame(reference_frame=GRIPPER_NAME, pose=Pose()), "world")
+    ).pose
+    y_axis = tool_axes(pose)["y"]
+    return math.degrees(math.atan2(y_axis[1], y_axis[0]))
 
 
 async def detect_cup(machine: RobotClient, vision: VisionClient):
@@ -334,6 +447,7 @@ async def detect_cup(machine: RobotClient, vision: VisionClient):
     to the real cup, so skip anything too flat to be a cup.
     """
     objects = await vision.get_object_point_clouds(CAMERA_NAME)
+    lap(f"vision service returned {len(objects)} object(s)")
     if not objects:
         raise RuntimeError("No objects detected")
 
@@ -348,6 +462,7 @@ async def detect_cup(machine: RobotClient, vision: VisionClient):
         )
         zs = [p[2] for p in points]
         height = percentile(zs, 99) - percentile(zs, 1)
+        lap(f"moved {label(obj)!r} cloud into the world frame")
         if height >= MIN_CUP_HEIGHT_MM:
             print(f"Detected: {label(obj)} ({len(points)} points, {height:.0f} mm tall)")
             return points, cam_origin
@@ -360,8 +475,10 @@ async def detect_cup(machine: RobotClient, vision: VisionClient):
     )
 
 
-async def move_gripper(motion: MotionClient, pose: Pose, straight: bool = False) -> None:
-    """Plan and run a gripper move in the world frame with the builtin motion service."""
+async def move_gripper(
+    motion: MotionClient, pose: Pose, straight: bool = False, component: str = GRIPPER_NAME
+) -> None:
+    """Plan and run a move of the gripper (or another component) in the world frame with the builtin motion service."""
     # The final descent and the lift must run straight so the fingers don't
     # sweep through the cup; other moves can take any collision-free path.
     constraints = (
@@ -377,12 +494,86 @@ async def move_gripper(motion: MotionClient, pose: Pose, straight: bool = False)
         else None
     )
     ok = await motion.move(
-        component_name=GRIPPER_NAME,
+        component_name=component,
         destination=PoseInFrame(reference_frame="world", pose=pose),
         constraints=constraints,
     )
+    lap(f"moved to x={pose.x:.0f} y={pose.y:.0f} z={pose.z:.0f} ({'straight' if straight else 'planned'})")
     if not ok:
         raise RuntimeError(f"motion service could not reach {pose}")
+
+
+def is_hand(detection, label: str) -> bool:
+    return label in (detection.class_name or "").lower()
+
+
+async def hands_in_view(machine: RobotClient) -> list:
+    detector = VisionClient.from_robot(machine, HAND_DETECTOR_NAME)
+    return [
+        d
+        for d in await detector.get_detections_from_camera(CAMERA_NAME)
+        if d.confidence > HAND_MIN_CONFIDENCE
+    ]
+
+
+async def gesture_labels(machine: RobotClient) -> list[str]:
+    """The lowercase labels the gesture detector reports for the camera's view right now."""
+    detector = VisionClient.from_robot(machine, GESTURE_DETECTOR_NAME)
+    return [
+        c.class_name.lower()
+        for c in await detector.get_classifications_from_camera(CAMERA_NAME, 5)
+        if c.confidence > GESTURE_MIN_CONFIDENCE
+    ]
+
+
+async def pick_gesture_seen(machine: RobotClient, hands: list, gestures: list[str]) -> bool:
+    """Return True on a poll where the user is showing the "pick the cup" gesture: a right-hand thumbs up.
+
+    `hands` are the confident hand detections and `gestures` the gesture labels
+    from the camera this poll. If a gesture label names its hand ("right", "left")
+    that decides which hand made it. If not, the hand detector decides: a right
+    hand in view and no left hand.
+    """
+    thumbs_up = [g for g in gestures if "thumb" in g and "up" in g]
+    if not thumbs_up:
+        return False
+    named = [g for g in thumbs_up if RIGHT_HAND_LABEL in g or LEFT_HAND_LABEL in g]
+    if named:
+        return any(RIGHT_HAND_LABEL in g for g in named)
+    return any(is_hand(d, RIGHT_HAND_LABEL) for d in hands) and not any(
+        is_hand(d, LEFT_HAND_LABEL) for d in hands
+    )
+
+
+async def release_gesture_seen(machine: RobotClient, hands: list) -> bool:
+    """Return True on a poll where the user is showing the "release" gesture.
+
+    `hands` are the confident hand detections from the camera this poll.
+    Placeholder until the real gesture check exists: a hand in view, either one.
+    """
+    return any(is_hand(d, LEFT_HAND_LABEL) or is_hand(d, RIGHT_HAND_LABEL) for d in hands)
+
+
+async def wait_for_pick_gesture(machine: RobotClient) -> None:
+    print("Waiting for a right-hand thumbs up...")
+    while True:
+        hands = await hands_in_view(machine)
+        gestures = await gesture_labels(machine)
+        if hands or gestures:
+            print(f"  hands in view: {[d.class_name for d in hands]}  gestures: {gestures}")
+        if await pick_gesture_seen(machine, hands, gestures):
+            return
+        await asyncio.sleep(0.2)
+
+
+async def go_to_start(machine: RobotClient) -> None:
+    """Move the arm to the start pose: by joint angles if they are set, else with the start switch."""
+    if START_JOINTS_DEG:
+        await Arm.from_robot(machine, ARM_NAME).move_to_joint_positions(
+            JointPositions(values=START_JOINTS_DEG)
+        )
+    else:
+        await Switch.from_robot(machine, START_SWITCH).set_position(2)
 
 
 def object_label(obj) -> str:
@@ -393,194 +584,76 @@ def box(d) -> tuple[float, float, float, float]:
     return (d.x_min, d.y_min, d.x_max, d.y_max)
 
 
-def locate_hand(points, cup_xy, cup_radius, cup_bottom_z, floor_z):
-    """Return (x, y, top_z, n_points, min_z, median_z) of the hand in world mm, or None.
-
-    The held cup and the fingers around it are in the same view and are
-    nearer the camera than the hand, so drop everything inside the cup's
-    footprint at or above its bottom before looking for the hand.
-
-    The hand's segment can hold the whole table, and depth noise far below it,
-    so only points between floor_z and HAND_MAX_Z_MM count. top_z is the 98th
-    percentile of those, kept high on purpose: a hand height that is too low
-    drives the cup into the hand, while one that is too high only leaves a gap.
-    """
-    keep = [
-        p
-        for p in points
-        if floor_z < p[2] < HAND_MAX_Z_MM
-        and not (
-            p[2] >= cup_bottom_z - 5
-            and math.hypot(p[0] - cup_xy[0], p[1] - cup_xy[1]) < cup_radius + HAND_EXCLUDE_MARGIN_MM
-        )
-    ]
-    if len(keep) < MIN_POINTS:
-        return None
-    zs = [p[2] for p in keep]
-    top = percentile(zs, 98)
-    upper = [p for p in keep if p[2] >= top - 30]
-    return (
-        sum(p[0] for p in upper) / len(upper),
-        sum(p[1] for p in upper) / len(upper),
-        top,
-        len(keep),
-        min(zs),
-        percentile(zs, 50),
-    )
-
-
-async def find_hand(machine, hold_xy, hold_bottom_z, cup_radius, floor_z, dump: str | None = None):
-    """Wait for a hand that holds still for two looks. Returns (x, y, top_z) or None.
-
-    The cup, held (or standing) at hold_xy with its bottom at hold_bottom_z,
-    is left out of the search.
-    """
-    vision = VisionClient.from_robot(machine, HAND_VISION_NAME)
-    last, deadline = None, time.monotonic() + FIND_HAND_TIMEOUT_S
-    while time.monotonic() < deadline:
-        found = []
-        for obj in await vision.get_object_point_clouds(CAMERA_NAME):
-            try:
-                points, _ = await cloud_in_world(
-                    machine, obj.point_cloud, obj.geometries.geometries[0].center
-                )
-            except ValueError:
-                continue
-            hand = locate_hand(points, hold_xy, cup_radius, hold_bottom_z, floor_z)
-            if hand:
-                found.append((hand, points))
-            else:
-                zs = sorted(p[2] for p in points)
-                above = [p for p in points if floor_z < p[2] < HAND_MAX_Z_MM]
-                near_cup = [
-                    p for p in above
-                    if math.hypot(p[0] - hold_xy[0], p[1] - hold_xy[1]) < cup_radius + HAND_EXCLUDE_MARGIN_MM
-                ]
-                cx = sum(p[0] for p in points) / len(points)
-                cy = sum(p[1] for p in points) / len(points)
-                print(
-                    f"  hand segment: {len(points)} points around ({cx:.0f}, {cy:.0f}), "
-                    f"z {zs[0]:.0f} / {zs[len(zs) // 2]:.0f} / {zs[-1]:.0f} (min/median/max); "
-                    f"{len(above)} above the table, {len(near_cup)} of those inside the cup's footprint"
-                )
-                if dump:
-                    with open(dump, "w") as f:
-                        f.write("x,y,z\n")
-                        f.writelines(f"{px:.1f},{py:.1f},{pz:.1f}\n" for px, py, pz in points)
-        if found:
-            hand, points = max(found, key=lambda f: f[0][3])
-            x, y, top, n, zmin, zmed = hand
-            print(f"Hand at ({x:.0f}, {y:.0f}), top z {top:.0f} mm ({n} points, z min {zmin:.0f}, median {zmed:.0f})")
-            if dump:
-                with open(dump, "w") as f:
-                    f.write("x,y,z\n")
-                    f.writelines(f"{px:.1f},{py:.1f},{pz:.1f}\n" for px, py, pz in points)
-            if last and math.hypot(x - last[0], y - last[1]) < HAND_STABLE_MM:
-                return x, y, max(top, last[2])  # the higher of the two looks
-            last = (x, y, top)
-        else:
-            last = None
-        await asyncio.sleep(0.3)
-    return None
-
-
-def handover_target(hand, plan: dict[str, Pose], cup: dict) -> Pose:
-    """Where the gripper goes so the bottom of the cup ends up above the hand."""
-    x, y, top = hand
-    cup_below_frame = plan["grasp"].z - cup["base_z"]  # gripper frame to the cup's bottom
-    return Pose(
-        x=x,
-        y=y,
-        z=top + HAND_CLEARANCE_MM + cup_below_frame,
-        o_x=0,
-        o_y=0,
-        o_z=-1,
-        theta=plan["grasp"].theta,
-    )
-
-
-async def hand_over(machine, motion, gripper, plan, cup, release: bool, dump: str | None = None) -> bool:
-    """Bring the held cup just above the user's hand; open when a hand rests under it. False if nobody took it."""
-    # Look from home, not from the lift pose. Up close the camera is inside the
-    # depth sensor's minimum range of a hand held under the cup and gets no depth.
-    try:
-        await Switch.from_robot(machine, HOME_POSE).set_position(2)
-    except ResourceNotFoundError:
-        print(f"No '{HOME_POSE}' switch; looking for the hand from the lift pose")
+async def hand_over(machine, gripper, release: bool) -> bool:
+    """Take the held cup to the end pose; open when the release gesture is shown. False if nobody asked for it."""
+    print("Moving to the end pose")
+    await Switch.from_robot(machine, END_SWITCH).set_position(2)
     await asyncio.sleep(0.5)
 
-    # Where is the held cup now? It is left out of the hand search.
-    frame = (
-        await machine.transform_pose(PoseInFrame(reference_frame=GRIPPER_NAME, pose=Pose()), "world")
-    ).pose
-    held_bottom_z = frame.z - (plan["grasp"].z - cup["base_z"])
-    print("Waiting for a hand...")
-    hand = await find_hand(
-        machine, (frame.x, frame.y), held_bottom_z, cup["radius"], cup["base_z"] + HAND_MIN_HEIGHT_MM, dump
-    )
-    if not hand:
-        print("No hand seen")
-        return False
-
-    target = handover_target(hand, plan, cup)
-    x, y, _ = hand
-    (x0, x1), (y0, y1) = REACH_LIMITS["x"], REACH_LIMITS["y"]
-    if not (x0 <= x <= x1 and y0 <= y <= y1 and target.z <= REACH_LIMITS["z_max"]):
-        print(f"Hand at ({x:.0f}, {y:.0f}) is outside the safe reach; not moving")
-        return False
-    hand_detector = VisionClient.from_robot(machine, HAND_DETECTOR_NAME)
-
-    async def hands_in_view():
-        return [
-            d
-            for d in await hand_detector.get_detections_from_camera(CAMERA_NAME)
-            if d.confidence > 0.5
-        ]
-
-    print(f"Moving the cup over the hand: x={target.x:.0f} y={target.y:.0f} z={target.z:.0f}")
-    await move_gripper(motion, target)
-    await asyncio.sleep(0.5)
-
-    since, deadline = None, time.monotonic() + RELEASE_TIMEOUT_S
+    since, last_seen, deadline = None, 0.0, time.monotonic() + RELEASE_TIMEOUT_S
+    print("Waiting for the release gesture...")
     while time.monotonic() < deadline:
-        hands = await hands_in_view()
+        hands = await hands_in_view(machine)
+        gesture = await release_gesture_seen(machine, hands)
         now = time.monotonic()
-        since = (since or now) if hands else None
+        if gesture:
+            since, last_seen = since or now, now
+        elif since and now - last_seen > HAND_LOST_GRACE_S:
+            since = None
         held_s = now - since if since else 0.0
-        print(f"{len(hands)} hand(s) in view  {held_s:.1f}/{HAND_DWELL_S:.1f}s")
+        print(f"{len(hands)} hand(s) in view, release gesture {gesture}  {held_s:.1f}/{HAND_DWELL_S:.1f}s")
 
         if held_s >= HAND_DWELL_S:
             if not release:
-                print("Hand seen (--no-release, so the gripper stays closed)")
+                print("Release gesture seen (--no-release, so the gripper stays closed)")
                 since = None
             else:
-                print("Hand seen: releasing")
-                await gripper.open()
-                await asyncio.sleep(1.0)
-                retreat = Pose(x=target.x, y=target.y, z=target.z + 100, o_x=0, o_y=0, o_z=-1, theta=target.theta)
-                await move_gripper(motion, retreat)
+                print("Release gesture seen: releasing")
+                await release_cup(gripper)
                 return True
         await asyncio.sleep(0.2)
-    print("Nobody took the cup")
+    print("No release gesture")
     return False
+
+
+async def release_cup(gripper: Gripper) -> None:
+    """Open the gripper slowly so the cup is lowered out of the fingers, not dropped."""
+    try:
+        await gripper.do_command({"set_gripper_speed": RELEASE_SPEED})
+    except Exception as e:  # never keep hold of the cup because the speed could not be set
+        print(f"Could not slow the gripper ({e}); opening at its current speed")
+    await gripper.open()
+    deadline = time.monotonic() + RELEASE_OPEN_TIMEOUT_S
+    while await gripper.is_moving() and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    await asyncio.sleep(SETTLE_S)
+    try:
+        await gripper.do_command({"set_gripper_speed": NORMAL_SPEED})
+    except Exception as e:
+        print(f"Could not restore the gripper speed ({e})")
 
 
 async def put_back(motion: MotionClient, gripper: Gripper, plan: dict[str, Pose]) -> None:
     """Return the cup to where it was picked up and let go."""
     await move_gripper(motion, plan["approach"])
     await move_gripper(motion, plan["grasp"], straight=True)
-    await gripper.open()
-    await asyncio.sleep(SETTLE_S)
+    await release_cup(gripper)
     await move_gripper(motion, plan["approach"], straight=True)
 
 
-async def execute(machine: RobotClient, plan: dict[str, Pose], cup: dict, args) -> None:
+async def execute(machine: RobotClient, plan: dict[str, Pose], args) -> None:
     """Drive the plan with the builtin motion service; every move is planned."""
     gripper = Gripper.from_robot(machine, GRIPPER_NAME)
     motion = MotionClient.from_robot(machine, MOTION_NAME)
 
     await gripper.open()
-    await move_gripper(motion, plan["approach"])
+    # A straight move stays in the arm's current wrist configuration. A free
+    # plan may reach the same pose with the wrist turned half a revolution.
+    try:
+        await move_gripper(motion, plan["approach"], straight=True)
+    except Exception as e:
+        print(f"Could not approach in a straight line ({e}); planning a free path")
+        await move_gripper(motion, plan["approach"])
     if args.stop_after == "approach":
         return
     await move_gripper(motion, plan["grasp"], straight=True)
@@ -593,15 +666,52 @@ async def execute(machine: RobotClient, plan: dict[str, Pose], cup: dict, args) 
         return
     await move_gripper(motion, plan["lift"], straight=True)
 
-    if args.handover and not await hand_over(
-        machine, motion, gripper, plan, cup, release=not args.no_release, dump=args.dump_hand
-    ):
-        print("Nobody took the cup; putting it back")
+    if args.handover and not await hand_over(machine, gripper, release=not args.no_release):
+        print("No release gesture; putting the cup back")
         await put_back(motion, gripper, plan)
+        await Switch.from_robot(machine, END_SWITCH).set_position(2)
+
+
+async def watch_gestures(machine: RobotClient, seconds: float = 60) -> None:
+    """Print what the gesture detector reports, to see the labels it uses. Does not move the arm."""
+    detector = VisionClient.from_robot(machine, GESTURE_DETECTOR_NAME)
+    print(f"Show gestures to the camera for {seconds:.0f} s...")
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        classifications = await detector.get_classifications_from_camera(CAMERA_NAME, 5)
+        print(f"classifications {[(c.class_name, round(c.confidence, 2)) for c in classifications]}")
+        await asyncio.sleep(0.5)
+
+
+async def plan_from_camera(machine: RobotClient, args) -> dict[str, Pose]:
+    """Look at the cup from the cup-view pose and plan the grasp for it."""
+    # Observe from the cup-view pose so the wrist-mounted camera sees the whole cup.
+    print("Moving to the cup-view pose")
+    await move_gripper(MotionClient.from_robot(machine, MOTION_NAME), CUP_VIEW_POSE, component=ARM_NAME)
+    lap("moved to the cup-view pose")
+    await asyncio.sleep(0.5)
+    vision = VisionClient.from_robot(machine, VISION_NAME)
+
+    points, cam_origin = await detect_cup(machine, vision)
+    if args.dump:
+        with open(args.dump, "w") as f:
+            f.write(f"# camera origin (world, mm): {cam_origin[0]:.1f} {cam_origin[1]:.1f} {cam_origin[2]:.1f}\n")
+            f.write("x,y,z\n")
+            f.writelines(f"{x:.1f},{y:.1f},{z:.1f}\n" for x, y, z in points)
+        print(f"Saved {len(points)} points to {args.dump}")
+    cup = estimate_cup(points, cam_origin)
+    yaw = await gripper_yaw_deg(machine) if KEEP_WRIST_YAW else None
+    plan = plan_grasp(cup, yaw)
+
+    print(
+        f"Cup axis ({cup['x']:.0f}, {cup['y']:.0f}) mm, "
+        f"rim diameter {2 * cup['radius']:.0f} mm, "
+        f"z {cup['base_z']:.0f} to {cup['top_z']:.0f} mm"
+    )
+    return plan
 
 
 async def main(args) -> None:
-    top_down = args.mode == "top"
     if not (MACHINE_ADDRESS and API_KEY and API_KEY_ID):
         raise SystemExit(
             "Set VIAM_MACHINE_ADDRESS, VIAM_API_KEY and VIAM_API_KEY_ID first."
@@ -619,29 +729,23 @@ async def main(args) -> None:
             attempt_reconnect_interval=0,
         ),
     ) as machine:
-        # Observe from home so the wrist-mounted camera sees the cup. Not every
-        # machine has a saved home pose; without one, leave the arm where it is.
-        try:
-            await Switch.from_robot(machine, HOME_POSE).set_position(2)
-        except ResourceNotFoundError:
-            print(f"No '{HOME_POSE}' switch; using the arm where it is. The cup must be in view.")
-        vision = VisionClient.from_robot(machine, VISION_NAME)
+        if args.print_joints:
+            joints = await Arm.from_robot(machine, ARM_NAME).get_joint_positions()
+            print(f"START_JOINTS_DEG = {[round(v, 2) for v in joints.values]}")
+            return
 
-        points, cam_origin = await detect_cup(machine, vision)
-        if args.dump:
-            with open(args.dump, "w") as f:
-                f.write(f"# camera origin (world, mm): {cam_origin[0]:.1f} {cam_origin[1]:.1f} {cam_origin[2]:.1f}\n")
-                f.write("x,y,z\n")
-                f.writelines(f"{x:.1f},{y:.1f},{z:.1f}\n" for x, y, z in points)
-            print(f"Saved {len(points)} points to {args.dump}")
-        cup = estimate_cup(points, cam_origin, top_down)
-        plan = plan_grasp(cup, top_down)
+        if args.watch_gestures:
+            await watch_gestures(machine)
+            return
 
-        print(
-            f"Cup axis ({cup['x']:.0f}, {cup['y']:.0f}) mm, "
-            f"{'rim ' if top_down else ''}diameter {2 * cup['radius']:.0f} mm, "
-            f"z {cup['base_z']:.0f} to {cup['top_z']:.0f} mm"
-        )
+        if args.execute:
+            print("Moving to the start pose")
+            await go_to_start(machine)
+            await wait_for_pick_gesture(machine)
+
+        lap("start pose and pick gesture")
+        plan = await plan_from_camera(machine, args)
+
         for name, pose in plan.items():
             print(
                 f"{name:>8}: x={pose.x:.1f} y={pose.y:.1f} z={pose.z:.1f} "
@@ -651,26 +755,18 @@ async def main(args) -> None:
         print(f"Gripper axes in world at grasp: {axes}")
 
         if args.execute:
-            await execute(machine, plan, cup, args)
-        elif args.handover:
-            # Rehearse the hand step without moving: where would the cup go?
-            print("Dry run: put your hand where the lifted cup would be. The arm will not move.")
-            hand = await find_hand(
-                machine, (cup["x"], cup["y"]), cup["base_z"], cup["radius"], cup["base_z"] + HAND_MIN_HEIGHT_MM, args.dump_hand
-            )
-            if hand:
-                t = handover_target(hand, plan, cup)
-                print(
-                    f"Would move the gripper to x={t.x:.0f} y={t.y:.0f} z={t.z:.0f}: "
-                    f"the cup's bottom {HAND_CLEARANCE_MM} mm above the hand's top at z={hand[2]:.0f}"
-                )
+            await execute(machine, plan, args)
         else:
             print("Dry run; pass --execute to move the arm")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("--mode", choices=("top", "side"), default="top")
+    parser.add_argument(
+        "--watch-gestures",
+        action="store_true",
+        help="print what the gesture detector reports for 60 s and exit (does not move)",
+    )
     parser.add_argument("--execute", action="store_true", help="move the arm")
     parser.add_argument("--dump", metavar="CSV", help="save the cup's world-frame points here")
     parser.add_argument(
@@ -679,7 +775,11 @@ if __name__ == "__main__":
         default="lift",
         help="with --execute, stop after this step (the gripper stays open through 'grasp')",
     )
-    parser.add_argument("--handover", action="store_true", help="after the lift, hand the cup to your hand")
+    parser.add_argument("--handover", action="store_true", help="after the lift, go to the end pose and release on the release gesture")
     parser.add_argument("--no-release", action="store_true", help="with --handover, never open the gripper")
-    parser.add_argument("--dump-hand", metavar="CSV", help="save the hand's world-frame points here")
+    parser.add_argument(
+        "--print-joints",
+        action="store_true",
+        help="print the arm's current joint angles as START_JOINTS_DEG and exit (does not move)",
+    )
     asyncio.run(main(parser.parse_args()))
