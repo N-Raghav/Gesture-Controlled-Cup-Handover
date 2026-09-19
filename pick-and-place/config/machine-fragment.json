@@ -35,6 +35,12 @@
       "name": "viam_detections-to-segments",
       "module_id": "viam:detections-to-segments",
       "version": "latest"
+    },
+    {
+      "type": "registry",
+      "name": "hackathons_hand-detect",
+      "module_id": "hackathons:hand-detect",
+      "version": "latest-with-prerelease"
     }
   ],
   "components": [
@@ -44,7 +50,7 @@
       "model": "viam:ufactory:xArm6",
       "attributes": {
         "host": "192.168.1.240",
-        "speed_degs_per_sec": 15,
+        "speed_degs_per_sec": 12,
         "ufactory-studio-proxy": true
       },
       "frame": {
@@ -100,7 +106,8 @@
           "depth"
         ],
         "align_color_depth": true,
-        "serial_number": "150622070496"
+        "serial_number": "150622070496",
+        "depth_visual_preset": "hand"
       },
       "frame": {
         "parent": "arm",
@@ -317,21 +324,6 @@
   ],
   "services": [
     {
-      "name": "builtin",
-      "api": "rdk:service:motion",
-      "model": "rdk:builtin:builtin",
-      "attributes": {
-        "input_range_override": {
-          "arm": {
-            "5": {
-              "min": -3.1416,
-              "max": 3.1416
-            }
-          }
-        }
-      }
-    },
-    {
       "name": "calibration-handeye",
       "api": "rdk:service:generic",
       "model": "viam:camera-calibration:handeye",
@@ -378,20 +370,21 @@
       }
     },
     {
-      "name": "vision-1",
+      "name": "cup",
       "api": "rdk:service:vision",
       "model": "rdk:builtin:mlmodel",
       "attributes": {
         "default_minimum_confidence": 0.5,
-        "mlmodel_name": "mlmodel-1"
+        "mlmodel_name": "mlmodel-1",
+        "camera_name": "cam"
       }
     },
     {
-      "name": "segmentation",
+      "name": "segmentation-cup",
       "api": "rdk:service:vision",
       "model": "viam:vision:detections-to-segments",
       "attributes": {
-        "detector_name": "vision-1",
+        "detector_name": "cup",
         "camera_name": "cam",
         "mean_k": 5,
         "sigma": 1.25,
@@ -399,6 +392,28 @@
         "depth_threshold_mm": 100,
         "min_points_in_segment": 50,
         "clustering_radius_mm": 10
+      }
+    },
+    {
+      "name": "hand-detect",
+      "api": "rdk:service:vision",
+      "model": "hackathons:hand-detect:mediapipe",
+      "attributes": {
+        "camera_name": "cam",
+        "source_name": "color",
+        "padding_px": 20
+      }
+    },
+    {
+      "name": "hand-segm",
+      "api": "rdk:service:vision",
+      "model": "viam:vision:detections-to-segments",
+      "attributes": {
+        "detector_name": "hand-detect",
+        "camera_name": "cam",
+        "mean_k": 5,
+        "sigma": 1.25,
+        "confidence_threshold_pct": 0.5
       }
     }
   ],
