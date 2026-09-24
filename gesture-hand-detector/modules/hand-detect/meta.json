@@ -1,0 +1,28 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "hackathons:hand-detect",
+  "visibility": "private",
+  "url": "",
+  "description": "Modular vision service: mediapipe",
+  "models": [
+    {
+      "api": "rdk:service:vision",
+      "model": "hackathons:hand-detect:mediapipe",
+      "markdown_link": "hackathons_hand-detect_mediapipe.md"
+    }
+  ],
+  "applications": null,
+  "markdown_link": "README.md",
+  "entrypoint": "dist/main",
+  "first_run": "",
+  "build": {
+    "build": "./build.sh",
+    "setup": "./setup.sh",
+    "path": "dist/archive.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64"
+    ]
+  }
+}

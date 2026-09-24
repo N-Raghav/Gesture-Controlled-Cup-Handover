@@ -1,0 +1,5 @@
+viam-sdk==0.80.0
+typing-extensions
+mediapipe==1.0.1
+# numpy==2.5.3
+Pillow==12.3.0

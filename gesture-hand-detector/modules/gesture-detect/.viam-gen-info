@@ -1,0 +1,13 @@
+{
+  "module_name": "gesture-detect",
+  "visibility": "private",
+  "namespace": "hackathons",
+  "language": "python",
+  "resource_type": "service",
+  "resource_subtype": "vision",
+  "model_name": "mediapipe",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-09-19T15:36:46.598098511Z",
+  "module_readme_link": "README.md"
+}
